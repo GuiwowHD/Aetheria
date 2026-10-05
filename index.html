@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no" />
+    <meta name="theme-color" content="#04060d" />
+    <meta name="color-scheme" content="dark" />
+    <title>Aetheria — a living four-dimensional fractal nebula</title>
+    <meta
+      name="description"
+      content="Aetheria is a real-time WebGPU particle universe: millions of particles evolving under a 4D fractal attractor and curl noise, projected through a hyperplane, rendered with a hand-written HDR post chain."
+    />
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <!-- The universe renders here. Everything else is chrome. -->
+    <canvas
+      id="stage"
+      aria-label="Interactive four-dimensional fractal nebula. Drag to rotate, click to ignite a supernova."
+      role="img"
+      tabindex="0"
+    ></canvas>
+
+    <div id="boot" role="status" aria-live="polite">
+      <h1 class="boot-title">Aetheria</h1>
+      <p class="boot-sub" id="boot-sub">seeding the four-dimensional void</p>
+      <div class="boot-bar"><i></i></div>
+      <pre id="boot-error"></pre>
+    </div>
+
+    <div class="hint" id="hint" aria-hidden="true">
+      <kbd>drag</kbd> 4D rotate · <kbd>shift</kbd>+<kbd>drag</kbd> hyperplanes · <kbd>wheel</kbd> zoom ·
+      <kbd>shift</kbd>+<kbd>wheel</kbd> slice · <kbd>click</kbd> supernova<br />
+      <kbd>space</kbd> pause · <kbd>R</kbd> reset · <kbd>H</kbd> hide UI · <kbd>S</kbd> PNG · <kbd>V</kbd> record 10s ·
+      <kbd>?</kbd> help
+    </div>
+
+    <p class="sr-only">
+      Aetheria renders a real-time simulation of up to four million particles moving through a four-dimensional
+      quaternion Julia attractor and an analytic curl-noise field. The fourth dimension is projected onto the screen
+      through a rotating hyperplane, so dragging rotates the cloud in the XW, YW and ZW planes. Making a sound or
+      enabling the procedural drone makes the nebula breathe with the low frequencies, shift its palette with the mid
+      frequencies, and sparkle with the high frequencies. All controls in the panel are keyboard operable.
+    </p>
+
+    <noscript>
+      <p style="color: #ff9a7a; font-family: sans-serif; padding: 32px">
+        Aetheria needs JavaScript and WebGPU (or WebGL2) to render the particle universe.
+      </p>
+    </noscript>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

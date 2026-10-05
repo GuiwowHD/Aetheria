@@ -1,0 +1,21 @@
+{
+  "name": "aetheria",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Aetheria — a living four-dimensional fractal nebula symphony. Hand-written WebGPU compute + render pipeline.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "build:fast": "vite build",
+    "preview": "vite preview --port 4173 --strictPort",
+    "typecheck": "tsc --noEmit",
+    "verify": "node tools/verify.mjs"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.74",
+    "puppeteer-core": "^25.12.0",
+    "typescript": "~5.9.3",
+    "vite": "^8.3.2"
+  }
+}
