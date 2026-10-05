@@ -1,0 +1,18 @@
+# Normalise line endings in the repository to LF, whatever the checkout platform.
+#
+# The shader sources are embedded in TypeScript template literals and their exact
+# bytes are what the GPU compilers see, so inconsistent endings are a real (if
+# unlikely) hazard, not just noise. Text is stored as LF and checked out as LF so
+# the working tree always matches what the compilers were tested against.
+* text=auto eol=lf
+
+# Binary assets must never be touched by end-of-line conversion.
+*.png binary
+*.jpg binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+
+# Generated or vendored trees are excluded from language statistics and diffs.
+pnpm-lock.yaml -diff linguist-generated
