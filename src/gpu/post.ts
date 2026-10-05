@@ -31,6 +31,7 @@
 import type { GpuContext } from './device';
 import { compileChecked } from './device';
 import { PostWriter } from '../core/uniforms';
+import type { PassTimer } from './timing';
 import {
   FULLSCREEN_VS,
   BRIGHT_PASS_WGSL,
@@ -76,6 +77,9 @@ export class PostChain {
   private readonly ctx: GpuContext;
   private readonly uniformBuffer: GPUBuffer;
   private readonly writer = new PostWriter();
+  /** Shared frame timer, attached by the renderer when profiling is enabled. */
+  private timer: PassTimer | null = null;
+  private profileCapture = false;
 
   private vsModule!: GPUShaderModule;
 
@@ -616,6 +620,11 @@ export class PostChain {
     return bind;
   }
 
+  /**
+   * Every stage of the chain goes through here, which is what makes per-pass GPU
+   * attribution possible: the timer brackets this one call site rather than
+   * needing instrumentation scattered through the pass list.
+   */
   private runPass(
     encoder: GPUCommandEncoder,
     label: string,
@@ -625,23 +634,25 @@ export class PostChain {
     slot: number,
     load: 'clear' | 'load'
   ): void {
+    const timing = this.timer?.bracket(encoder, label, this.profileCapture);
     const rp = encoder.beginRenderPass({
       label,
       colorAttachments: [
         { view: target, loadOp: load, storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } },
       ],
+      ...(timing ? { timestampWrites: timing } : {}),
     });
     rp.setPipeline(pass.pipeline);
     rp.setBindGroup(0, bind, [slot * SLOT_STRIDE]);
     rp.draw(3);
     rp.end();
-    // Opt-in audit: `?wgsl=1` collects a pass/target/binding table so a WebGPU
-    // usage conflict can be attributed to a specific pass instead of guessed at.
-    const audit = (window as unknown as { __AETHERIA_AUDIT?: string[] }).__AETHERIA_AUDIT;
-    if (audit) {
-      const reads = (bind as unknown as { __reads?: string[] }).__reads ?? [];
-      audit.push(`${label} | target=${target.label || '(none)'} | reads=${reads.join(',') || '(untagged)'}`);
-    }
+    if (timing) this.timer?.close(encoder);
+  }
+
+  /** Attach a shared frame timer so each stage reports its own GPU cost. */
+  setTimer(timer: PassTimer, capture: boolean): void {
+    this.timer = timer;
+    this.profileCapture = capture;
   }
 
   setQuality(dof: boolean, volumetric: boolean): void {

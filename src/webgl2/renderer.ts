@@ -348,6 +348,8 @@ export class WebGL2Renderer implements Renderer {
       computeMs: 0,
       simCount: 0,
       renderCount: 0,
+      // The WebGL2 path has no radius-derived budget, so it never culls.
+      culledCount: 0,
       drawVertices: 0,
       renderScale: 1,
       drawWidth: 1,
@@ -1263,7 +1265,6 @@ export class WebGL2Renderer implements Renderer {
     s.shockGain = clampNum(num(p.shock, 1), 0, 3);
     s.bloom = clampNum(num(p.bloom, 0.62), 0, 4);
     s.dpr = this.dpr;
-    s.quality = this.qualityScale;
 
     s.focusDist = this.camDist;
     s.aperture = clampNum(num(p.dof, 0.45), 0, 1.5) * 0.6;

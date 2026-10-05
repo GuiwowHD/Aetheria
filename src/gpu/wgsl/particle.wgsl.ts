@@ -36,21 +36,6 @@ struct VSOut {
   @location(4) @interpolate(linear) spark : f32,
 };
 
-fn hsl2rgb(h : f32, s : f32, l : f32) -> vec3f {
-  let c = (1.0 - abs(2.0 * l - 1.0)) * s;
-  let hp = fract(h) * 6.0;
-  let x = c * (1.0 - abs(fract(hp) - 1.0));
-  var rgb = vec3f(0.0);
-  let i = u32(hp) % 6u;
-  if (i == 0u) { rgb = vec3f(c, x, 0.0); }
-  else if (i == 1u) { rgb = vec3f(x, c, 0.0); }
-  else if (i == 2u) { rgb = vec3f(0.0, c, x); }
-  else if (i == 3u) { rgb = vec3f(0.0, x, c); }
-  else if (i == 4u) { rgb = vec3f(x, 0.0, c); }
-  else { rgb = vec3f(c, 0.0, x); }
-  return rgb + (l - 0.5 * c);
-}
-
 @vertex
 fn vs_main(
   @builtin(vertex_index) vid : u32,
@@ -59,21 +44,35 @@ fn vs_main(
   let corner = vec2f(f32(vid & 1u), f32((vid >> 1u) & 1u)) * 2.0 - 1.0;
   let sub = f32(vid >> 2u); // 0 for the primary image, 0..3 for the scatter copies
 
-  let particleCount = u32(U.uTime.w);
-  let primary = inst % max(particleCount, 1u);
-
   // ---------------------------------------------------------------------
-  // Multiplicity: draw the same simulated particle several times with a
-  // deterministic sub-offset. This is how "10M displayed particles" is
-  // honoured without paying 10M×88 bytes of simulation memory — the copies are
-  // visually indistinguishable from extra particles but cost only vertices.
-  // ---------------------------------------------------------------------
-  let multipl = max(U.uRender.z, 1.0);
-  let copy = min(floor(f32(inst) / f32(max(particleCount, 1u))), multipl - 1.0);
+  // Instance -> particle mapping.
+  //
+  // The obvious form, an integer modulo against the count, is the single most
+  // expensive thing this shader can do: unsigned integer modulo is not a hardware
+  // op on current GPUs, so it expands into a reciprocal-multiply sequence with a
+  // long dependency chain, executed once per vertex - millions of times a frame.
+  //
+  // It is replaced by a float division. The count is well under 2^24 and the
+  // instance index is under 2^32, so the quotient is exact in f32, and
+  // (inst - count * floor(inst / count)) recovers the remainder exactly while
+  // emitting no long-latency integer division at all.
+  //
+  // This keeps the count an arbitrary number rather than a power of two, which
+  // matters: the frame budget has to be honoured at whatever value it computes,
+  // and rounding to the next power of two could overshoot it by nearly 2x.
+  //
+  // Copies come first and primary particles last, so the drawn range is a whole
+  // number of copies and every copy covers every live particle.
+  let count = max(U.uMisc.w, 1.0);
+  let copy = floor(f32(inst) / count);
+  let primary = u32(f32(inst) - count * copy);
+  let copies = max(U.uRender.z, 1.0);
+  // Clamp so a draw range larger than count * copies cannot index out of bounds.
   var jitter = vec3f(0.0);
-  if (copy > 0.0 || sub > 0.0) {
+  let copyClamped = min(copy, copies - 1.0);
+  if (copyClamped > 0.0 || sub > 0.0) {
     let h = hash1(inst * 2654435761u + vid * 40503u + 7u);
-    let r = 0.028 * (0.4 + 0.6 * f32(copy));
+    let r = 0.028 * (0.4 + 0.6 * copyClamped);
     jitter = vec3f(
       rndRange(h, 0u, -r, r),
       rndRange(h, 1u, -r, r),
@@ -127,7 +126,26 @@ fn vs_main(
   let hero = smoothstep(0.86, 1.0, c4.w);
   sizePx = sizePx * (1.0 + hero * 2.4);
 
-  let px = sizePx * 0.5 * corner * U.uViewport.zw;
+  // Ablation hook, enabled only by the profiling tools: uMisc2.w scales the sprite
+  // radius. Crushing it to a pixel or two removes almost all fill work while
+  // leaving the per-instance vertex work untouched, which is what separates a
+  // fill-bound pass from a vertex-bound one.
+  sizePx = sizePx * max(U.uMisc2.w, 0.01);
+
+  // The quad is sized to what the sprite actually draws, not to a fixed multiple
+  // of it. The core falloff is exp(-12 r^2), so the radius at which it becomes
+  // negligible is sqrt(-ln(T)/12); a quad of that extent already covers every
+  // fragment that survives the alpha test. Sizing it generously instead spends
+  // rasteriser bandwidth on fragments that are discarded a few instructions later.
+  //
+  // The visible radius is derived from the same falloff the fragment stage uses:
+  // exp(-12 r^2) = T  =>  r = sqrt(-ln(T)/12). A halo term extends it slightly
+  // for the few bright sprites where it is noticeable.
+  let coreRadius = sqrt(0.3838); // sqrt(-ln(0.01)/12)
+  let haloExtent = 1.0 + 0.35 * (1.0 - exp(-sizePx * 0.5));
+  let quadScale = coreRadius * haloExtent;
+
+  let px = sizePx * quadScale * corner * U.uViewport.zw;
   let outPos = vec4f(safeClip.xy / safeClip.w + px, safeClip.z, safeClip.w);
 
   // ---------------------------------------------------------------------
@@ -181,6 +199,8 @@ struct VSOut {
  */
 @fragment
 fn fs_main(in : VSOut) -> @location(0) vec4f {
+  // The quad now matches the visible sprite, so this test rejects almost nothing;
+  // it stays as a guard for the thin ring where the halo has faded out.
   let r2 = dot(in.uv, in.uv);
   if (r2 > 1.0) { discard; }
 

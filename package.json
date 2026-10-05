@@ -10,7 +10,9 @@
     "build:fast": "vite build",
     "preview": "vite preview --port 4173 --strictPort",
     "typecheck": "tsc --noEmit",
-    "verify": "node tools/verify.mjs"
+    "verify": "node tools/verify.mjs",
+    "profile": "node tools/profile-gpu.mjs",
+    "tune": "node tools/tune-visual.mjs"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.74",

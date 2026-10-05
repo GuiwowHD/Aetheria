@@ -386,7 +386,10 @@ export class Ui {
     set('fps', `${fps.toFixed(0)}`, fps >= 55 ? 'good' : fps >= 30 ? 'mid' : 'bad');
     set('gpu', stats.gpuTimingSupported ? `${stats.gpuMs.toFixed(2)}ms` : `${stats.frameMs.toFixed(1)}ms`);
     set('cpu', `${stats.cpuMs.toFixed(2)}ms`);
-    set('particles', `${(stats.simCount / 1e6).toFixed(2)}M / ${(stats.renderCount / 1e6).toFixed(1)}M`);
+    // The suffix shows how many particles the frame budget declined to draw, so a
+    // reduced count is visible rather than looking like a broken slider.
+    const culled = stats.culledCount > 0 ? ` (-${(stats.culledCount / 1e6).toFixed(1)}M)` : '';
+    set('particles', `${(stats.simCount / 1e6).toFixed(2)}M / ${(stats.renderCount / 1e6).toFixed(1)}M${culled}`);
     set('scale', `${(stats.renderScale * 100).toFixed(0)}%`, stats.renderScale < 0.75 ? 'mid' : undefined);
     set('memory', `${stats.memoryEstimateMB.toFixed(0)}MB`, stats.memoryEstimateMB > 480 ? 'bad' : undefined);
 

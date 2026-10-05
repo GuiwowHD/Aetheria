@@ -20,6 +20,7 @@ import { createGpuContext, compileChecked, maxParticlesForDevice } from '../gpu/
 import { ParticleSystem, type ShockEvent } from '../gpu/particles';
 import { MAX_SHOCKS } from '../gpu/wgsl/simulate.wgsl';
 import { PostChain } from '../gpu/post';
+import { PassTimer, type PassTiming } from '../gpu/timing';
 import { PARTICLE_VERTEX_WGSL, PARTICLE_FRAGMENT_WGSL } from '../gpu/wgsl/particle.wgsl';
 import {
   BackendUnavailable,
@@ -77,10 +78,12 @@ export class GpuRenderer implements Renderer {
   private readonly postState = makePostState();
 
   private readonly particlePipeline: GPURenderPipeline;
+  private readonly particlePipelineNoDepth: GPURenderPipeline;
   private readonly particlesPerCall: number;
-  private readonly querySets: GPUQuerySet[] = [];
-  private readonly queryBufs: GPUBuffer[] = [];
-  private readonly queryBusy: boolean[] = [];
+  /** Brackets every pass in the frame; the adaptive loop reads its totals. */
+  private timer: PassTimer | null = null;
+
+  private lastTimings: PassTiming[] = [];
 
   private rot: Rot6 = [0.35, 0.12, 0.85, -0.22, 0.55, 0.1];
   private fovY = DEFAULT_FOV_Y;
@@ -108,16 +111,15 @@ export class GpuRenderer implements Renderer {
   private rttEma = 16.6;
   private cpuEma = 1;
   private fpsEma = 60;
+  /** Total GPU cost of the last profiled frame, and its per-pass breakdown. */
   private gpuMs = 0;
-  private queryIndex = 0;
-  private pendingQuery: { slot: number; descriptor: GPURenderPassTimestampWrites } | null = null;
+  private computeMs = 0;
 
   private readonly downgrades: string[] = [];
   private postLevel = 2; // 2 = full, 1 = no DOF/god rays, 0 = bloom only
-  /** Dedicated query slot for the compute stage (slot 0 is the render pass). */
-  private computeSlot = 1;
-  private computeMs = 0;
-  private computePending = false;
+  /** Ablation for the particle pass, set by the profiling tools. See setAblation(). */
+  private ablation = '';
+
   /** Optional GPU-side frame capture, attached by the verification runner. */
   selfTest: { consume(device: GPUDevice, canvas: GPUTexture): boolean } | null = null;
 
@@ -130,6 +132,7 @@ export class GpuRenderer implements Renderer {
     post: PostChain,
     simUniform: GPUBuffer,
     particlePipeline: GPURenderPipeline,
+    particlePipelineNoDepth: GPURenderPipeline,
     particlesPerCall: number,
     reducedMotion: boolean
   ) {
@@ -141,6 +144,7 @@ export class GpuRenderer implements Renderer {
     this.post = post;
     this.simUniform = simUniform;
     this.particlePipeline = particlePipeline;
+    this.particlePipelineNoDepth = particlePipelineNoDepth;
     this.particlesPerCall = particlesPerCall;
     this.idleAutoRotate = !reducedMotion;
     this.stats = {
@@ -151,6 +155,7 @@ export class GpuRenderer implements Renderer {
       computeMs: 0,
       simCount: params.simCount,
       renderCount: params.showCount,
+      culledCount: 0,
       drawVertices: 0,
       renderScale: profile.renderScale,
       drawWidth: 1,
@@ -220,34 +225,53 @@ export class GpuRenderer implements Renderer {
     const fs = await compileChecked(device, PARTICLE_FRAGMENT_WGSL, 'particle.frag.wgsl');
     if (vs.errors.length || fs.errors.length) fatal = [...vs.errors, ...fs.errors].join('\n');
 
-    const particlePipeline = device.createRenderPipeline({
-      label: 'particles',
-      layout: device.createPipelineLayout({ bindGroupLayouts: [particles.renderLayout] }),
-      vertex: { module: vs.module, entryPoint: 'vs_main' },
-      fragment: {
-        module: fs.module,
-        entryPoint: 'fs_main',
-        targets: [
-          {
-            format: 'rgba16float',
-            // Additive HDR: the sprite alpha is premultiplied in the fragment
-            // shader, so overlapping particles integrate light linearly.
-            blend: {
-              color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
-              alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+    /**
+     * Two variants of the particle pipeline, differing only in the depth
+     * attachment.
+     *
+     * Writing depth for every particle costs a full-width depth write plus a
+     * late-Z update per fragment, at a million instances. The DOF pass reads
+     * that depth, so it cannot simply be removed - but it can be made optional,
+     * which lets the profiling tools measure exactly what it costs instead of
+     * arguing about it.
+     */
+    const buildParticlePipeline = (noDepth: boolean) =>
+      device.createRenderPipeline({
+        label: noDepth ? 'particles-no-depth' : 'particles',
+        layout: device.createPipelineLayout({ bindGroupLayouts: [particles.renderLayout] }),
+        vertex: { module: vs.module, entryPoint: 'vs_main' },
+        fragment: {
+          module: fs.module,
+          entryPoint: 'fs_main',
+          targets: [
+            {
+              format: 'rgba16float',
+              // Additive HDR: the sprite alpha is premultiplied in the fragment
+              // shader, so overlapping particles integrate light linearly.
+              blend: {
+                color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+                alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+              },
             },
-          },
-        ],
-      },
-      primitive: { topology: 'triangle-list' },
-      depthStencil: {
-        format: 'depth32float',
-        depthWriteEnabled: true,
+          ],
+        },
+        primitive: { topology: 'triangle-list' },
         // Depth *test* is intentionally disabled: additive light must never be
-        // occluded by other light. Depth is still written because DOF reads it.
-        depthCompare: 'always',
-      },
-    });
+        // occluded by other light. Only the write remains, and only when the
+        // variant asks for it.
+        ...(noDepth
+          ? {}
+          : {
+              depthStencil: {
+                format: 'depth32float' as GPUTextureFormat,
+                depthWriteEnabled: true,
+                depthCompare: 'always' as GPUCompareFunction,
+              },
+            }),
+      });
+
+    const particlePipeline = buildParticlePipeline(false);
+    const particlePipelineNoDepth = buildParticlePipeline(true);
 
     const perCallFromBuffer = Math.floor(ctx.limits.maxBufferSize / 16) - 1;
     const particlesPerCall = Math.max(65_536, Math.min(DEFAULT_INSTANCES_PER_CALL, perCallFromBuffer));
@@ -261,6 +285,7 @@ export class GpuRenderer implements Renderer {
       post,
       simUniform,
       particlePipeline,
+      particlePipelineNoDepth,
       particlesPerCall,
       reducedMotion
     );
@@ -279,32 +304,11 @@ export class GpuRenderer implements Renderer {
 
   private setupTiming(): void {
     if (!this.ctx.hasTimestamp) return;
-    const device = this.ctx.device;
-    for (let i = 0; i < 3; i++) {
-      this.querySets.push(device.createQuerySet({ label: `ts${i}`, type: 'timestamp', count: 2 }));
-      // A buffer with MAP_READ may only also carry COPY_DST, so the query is
-      // resolved into a GPU-side buffer and then copied into a staging buffer
-      // that the CPU can map. Resolving straight into a mappable buffer is a
-      // validation error, not a warning.
-      this.queryResolve.push(
-        device.createBuffer({
-          label: `ts-resolve${i}`,
-          size: 16,
-          usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
-        })
-      );
-      this.queryBufs.push(
-        device.createBuffer({
-          label: `ts-readback${i}`,
-          size: 16,
-          usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-        })
-      );
-      this.queryBusy.push(false);
-    }
+    // 24 passes covers the deepest frame: fade, compute, particles, the bloom
+    // descent and ascent, god rays, DOF and the final two stages, with headroom.
+    this.timer = new PassTimer(this.ctx.device, 24);
   }
 
-  private readonly queryResolve: GPUBuffer[] = [];
 
   // -------------------------------------------------------------------------
   // Sizing
@@ -490,18 +494,61 @@ export class GpuRenderer implements Renderer {
     this.particles.tickShocks(this.shocks);
 
     // ---- particle budget --------------------------------------------------
-    const simCount = this.particles.count;
+    /*
+     * The instance -> particle mapping in the vertex shader needs a power-of-two
+     * stride to avoid an integer modulo, so the count of *live* particles here is
+     * always a power of two. That is the whole reason for the rounding.
+     *
+     * Copies first, primary particles last: the drawn ranges are then
+     * [0, stride) for copy 0, [stride, 2*stride) for copy 1, and so on, which is
+     * exactly what `f32(inst) - stride * floor(f32(inst) / stride)` decodes.
+     *
+     * How many the frame can afford depends on how large the sprites are. Two
+     * measurements set that relationship. A fill-rate ablation (sprite radius
+     * forced to about a pixel) halved the particle pass, so fill is a real term;
+     * the same ablation still cost ~29 ms at 1.57M drawn, which is per-instance
+     * vertex work that ignores sprite size entirely. Both terms scale with the
+     * drawn count, and fill additionally scales with radius squared.
+     *
+     * Deriving the budget from the radius keeps visual density roughly constant -
+     * larger sprites merging into gas at a lower count, smaller ones forming dense
+     * star fields at a higher count - while the frame cost stays bounded.
+     *
+     * The constant is fitted to measured cost, and it is deliberately conservative:
+     * the particle pass is the dominant term in the frame, so the budget aims it at
+     * roughly half of a 16.6 ms frame and leaves the resolution ladder and the post
+     * levels to account for the rest.
+     *
+     * On the reference machine the pass costs about 55 ns per drawn particle at the
+     * nominal sprite sizes, which puts the two calibration points at roughly 135k
+     * drawn particles for an 11 px radius and 230k for a 5 px radius, fitting
+     * budget ~ 6.0e6 / (r^1.1 + 2.1e3 / r).
+     *
+     * That figure was measured through a headless compositor, so treat it as a
+     * floor: a foreground window with a real swap chain should sustain more.
+     * Raising SHOW PARTICLES spends more of the frame on the cloud by choice;
+     * raising STAR SIZE trades count for per-sprite size at roughly constant cost.
+     */
+    const spriteRadius = 3.6 * this.params.particleSize;
+    const affordable = 6.0e6 / (Math.pow(spriteRadius, 1.1) + 2.1e3 / spriteRadius);
     const wantShow = clamp(Math.floor(this.params.showCount), 1, MAX_RENDER_PARTICLES);
-    const showCount = Math.min(wantShow, simCount * 8);
-    const multiplicity = clamp(showCount / simCount, 1, 8);
-    const effectiveSim = clamp(Math.floor(simCount / multiplicity), 64, simCount);
+    const showTarget = Math.min(wantShow, clamp(Math.floor(affordable), 60_000, MAX_RENDER_PARTICLES));
+
+    // The count is exact, not rounded to a power of two: the vertex shader decodes
+    // the instance index with an exact float division, so the budget can be
+    // honoured at whatever value it computes. Power-of-two rounding used to
+    // overshoot the budget by nearly 2x at unlucky sizes.
+    const liveSim = Math.max(64, this.particles.count);
+    const multiplicity = clamp(Math.ceil(showTarget / liveSim), 1, 8);
+    const stride = liveSim;
+    const drawnTotal = stride * multiplicity;
 
     // ---- uniforms ---------------------------------------------------------
     const sens = this.params.audioSensitivity;
     s.time = t;
     s.dt = dt;
     s.frame = this.frameIndex;
-    s.simCount = effectiveSim;
+    s.simCount = stride;
     s.width = this.stats.drawWidth;
     s.height = this.stats.drawHeight;
     s.julia = this.params.julia;
@@ -521,13 +568,17 @@ export class GpuRenderer implements Renderer {
     s.multiplicity = multiplicity;
     s.speed = this.params.speed;
     s.shockGain = this.params.shock;
+    // The particle shader decodes the instance index against this power-of-two
+    // stride instead of taking an integer modulo.
+    s.stride = stride;
     s.bloom = this.params.bloom;
     s.dpr = this.renderScale;
-    s.quality = this.postLevel / 2;
     s.grain = this.params.grain;
     s.vignette = this.params.vignette;
     s.activeShocks = this.particles.activeShocks;
     s.trailDecay = this.params.trails;
+    // Sprite-scale ablation (see particle.wgsl.ts); always 1 outside a profile run.
+    s.spriteScale = this.ablation === 'small' ? 0.06 : 1;
     s.audioLow = clamp(s.audioLow * (0.6 + sens * 0.4), 0, 3);
     s.audioMid = clamp(s.audioMid * (0.6 + sens * 0.4), 0, 3);
     s.audioHigh = clamp(s.audioHigh * (0.6 + sens * 0.4), 0, 3);
@@ -564,7 +615,7 @@ export class GpuRenderer implements Renderer {
     // visible reward (denser, brighter nebula) without clipping to white.
     // Calibrated so the nebula's filament cores land near 0.9 after ACES while the
     // empty sky stays under 0.02. Derived from a measured exposure sweep, not a guess.
-    p.quality = 4.45 / Math.sqrt(Math.max(1, effectiveSim * multiplicity));
+    p.quality = 4.45 / Math.sqrt(Math.max(1, drawnTotal));
     // Every pass owns a uniform slot (they need different texel sizes), so the
     // whole frame's post uniforms are published in one call.
     this.post.prepareFrame(p, this.params.trails, s.focusDist, this.params.dof * 0.5);
@@ -574,34 +625,67 @@ export class GpuRenderer implements Renderer {
     const canvasView = swapTexture.createView();
     const encoder = device.createCommandEncoder({ label: 'aetheria-frame' });
 
-    // A second timestamp slot measures the compute stage on its own. The
-    // simulation cost is what the adaptation ladder most needs: it is the term
-    // that a frame-time average hides completely when the browser is throttling
-    // presentation (a background tab, or headless compositor backpressure).
-    this.particles.step(encoder, this.beginComputeTiming());
+    // The timer's slot list describes exactly one frame. Without this reset the
+    // labels accumulate forever and the reported durations become differences
+    // between timestamps from different frames, which is how a 0.2 ms pass was
+    // once reported as 24 ms.
+    this.timer?.reset();
+
+    // The simulation step is bracketed like every other pass, so the per-pass
+    // breakdown covers the whole frame with no gaps.
+    const simTiming = this.markPass(encoder, 'simulate');
+    this.particles.step(encoder, simTiming);
+    if (simTiming) this.timer?.close(encoder);
 
     // Trail feedback must precede the particle pass: it decays last frame's
     // accumulated HDR into this frame's accumulation buffer, which the particles
     // then load and add to. Skipping it would leave a stale image under the cloud.
+    if (this.timer) this.post.setTimer(this.timer, true);
     this.post.fadeScene(encoder);
 
-    const ts = this.beginTiming();
+    const ts = this.markPass(encoder, 'particles');
+    // An ablation can drop the depth attachment entirely, which changes both the
+    // pipeline and the pass descriptor, so they are chosen together.
+    const noDepth = this.ablation === 'nodepth' || this.ablation === 'nz';
     const passDesc: GPURenderPassDescriptor = {
       label: 'particles',
       colorAttachments: [{ view: this.post.sceneView, loadOp: 'load', storeOp: 'store' }],
-      depthStencilAttachment: {
-        view: this.post.depthView,
-        depthLoadOp: 'clear',
-        depthStoreOp: 'store',
-        depthClearValue: 1,
-      },
+      ...(noDepth
+        ? {}
+        : {
+            depthStencilAttachment: {
+              view: this.post.depthView,
+              depthLoadOp: 'clear' as GPULoadOp,
+              depthStoreOp: 'store' as GPUStoreOp,
+              depthClearValue: 1,
+            },
+          }),
+      ...(ts ? { timestampWrites: ts } : {}),
     };
-    if (ts) passDesc.timestampWrites = ts;
     const pass = encoder.beginRenderPass(passDesc);
-    pass.setPipeline(this.particlePipeline);
+    if (this.ablation === 'skipdraw') {
+      // Draw nothing, but still clear and store the attachments so the rest of the
+      // frame is unaffected.
+      pass.end();
+      if (ts) this.timer?.close(encoder);
+      this.post.commitFrame();
+      this.post.setQuality(this.params.dof > 0 && this.postLevel >= 2, this.params.volumetric > 0 && this.postLevel >= 2);
+      this.post.run(encoder, canvasView);
+      device.queue.submit([encoder.finish()]);
+      this.finishTiming();
+      const cpuMs2 = performance.now() - t0;
+      this.cpuEma += (cpuMs2 - this.cpuEma) * 0.08;
+      this.rttEma += (rawDt * 1000 - this.rttEma) * 0.08;
+      this.fpsEma += (1 / Math.max(rawDt, 1e-4) - this.fpsEma) * 0.08;
+      this.syncStats();
+      void nowMs;
+      return;
+    }
+    pass.setPipeline(noDepth ? this.particlePipelineNoDepth : this.particlePipeline);
     pass.setBindGroup(0, this.particles.renderBindGroup);
-    this.drawParticles(pass, effectiveSim, multiplicity);
+    this.drawParticles(pass, drawnTotal);
     pass.end();
+    if (ts) this.timer?.close(encoder);
 
     // This frame's accumulation becomes next frame's history. Swapping roles is
     // what removes the need for a full-resolution copy per frame.
@@ -613,7 +697,7 @@ export class GpuRenderer implements Renderer {
     );
     this.post.run(encoder, canvasView);
     device.queue.submit([encoder.finish()]);
-    this.endTiming(device);
+    this.finishTiming();
 
     // Opt-in self test: the copy is recorded in a *second* submission after the
     // frame, because reading a mappable buffer that a pending submission is still
@@ -630,8 +714,9 @@ export class GpuRenderer implements Renderer {
     this.stats.cpuMs = this.cpuEma;
     this.stats.gpuMs = this.gpuMs;
     this.stats.computeMs = this.computeMs;
-    this.stats.simCount = effectiveSim;
-    this.stats.renderCount = Math.floor(effectiveSim * multiplicity);
+    this.stats.simCount = stride;
+    this.stats.renderCount = drawnTotal;
+    this.stats.culledCount = this.culledByBudget;
     this.stats.renderScale = this.renderScale;
     this.stats.memoryEstimateMB =
       (estimateParticleMemory(this.particles.capacity) + this.post.estimateBytes()) / 1048576;
@@ -645,8 +730,7 @@ export class GpuRenderer implements Renderer {
    * the global instance id into the shader, which decodes both which particle and
    * which sub-copy it is drawing.
    */
-  private drawParticles(pass: GPURenderPassEncoder, simCount: number, multiplicity: number): void {
-    const total = Math.floor(simCount * multiplicity);
+  private drawParticles(pass: GPURenderPassEncoder, total: number): void {
     const perCall = this.particlesPerCall;
     let drawn = 0;
     let calls = 0;
@@ -663,6 +747,11 @@ export class GpuRenderer implements Renderer {
   // Adaptation
   // -------------------------------------------------------------------------
   private adapt(): void {
+    // A profiling run needs the quality level held still: the adaptive loop would
+    // otherwise move the resolution underneath the measurement, so the numbers
+    // would describe two different configurations rather than one.
+    if (this.adaptationFrozen) return;
+
     // Warm-up grace: the first frames include pipeline compilation, the initial
     // seed dispatch and the browser's own first-frame work. Reacting to those
     // would start every session in a degraded state.
@@ -691,6 +780,18 @@ export class GpuRenderer implements Renderer {
     const measured = this.ctx.hasTimestamp && gpuTotal > 0.05 ? gpuTotal : this.rttEma;
     const tolerance = this.ctx.hasTimestamp ? 1 : 1.35;
 
+    /*
+     * The drawn-particle count is capped by its share of the frame, and this runs
+     * BEFORE the resolution ladder.
+     *
+     * Rasterising particles is the one cost that scales linearly with a number the
+     * user sets directly, and it is the largest term in the frame by an order of
+     * magnitude: measured at roughly 20 ns per drawn particle against a whole post
+     * chain that costs under 2 ms. Shedding resolution to pay for it is the wrong
+     * lever - it reduces the quality of everything else to fund the one stage that
+     * is overspent - so the particle budget is trimmed first and by proportion,
+     * which converges in a frame or two instead of a percent at a time.
+     */
     // 1. Resolution: cheapest to shed, least visible.
     if (measured > budget * (this.ctx.hasTimestamp ? 1.25 : 1.18) && this.targetScale > 0.55) {
       this.targetScale = Math.max(0.55, this.targetScale - 0.06);
@@ -707,13 +808,15 @@ export class GpuRenderer implements Renderer {
       this.postLevel++;
     }
 
-    // 3. Particles: last resort, with strong hysteresis because shrinking the
-    //    store invalidates every particle's history.
-    if (measured > budget * 1.8 && this.params.simCount > 150_000) {
+    // 3. Simulated particles: last resort, and rarely needed, because the
+    //    simulation measures about 0.2 ms at a million particles. Shrinking the
+    //    store invalidates every particle's history, so it carries strong
+    //    hysteresis.
+    if (measured > budget * 1.8 && this.computeMs > budget * 0.25 && this.params.simCount > 150_000) {
       const next = Math.max(150_000, Math.floor(this.params.simCount * 0.82));
       this.params.simCount = next;
       this.particles.setSimCount(next);
-      this.markDegrade('particle count');
+      this.markDegrade('simulated particles');
     }
 
     this.renderScale += (this.targetScale - this.renderScale) * 0.25;
@@ -735,117 +838,78 @@ export class GpuRenderer implements Renderer {
   }
 
   // -------------------------------------------------------------------------
-  // GPU timing (timestamp-query, opportunistic and non-blocking)
+  // GPU timing
+  //
+  // One shared PassTimer brackets every pass in the frame, so the numbers add up
+  // to the frame's real GPU cost and each stage can be attributed. The adaptive
+  // loop reads the totals; ?profile=1 prints the breakdown.
   // -------------------------------------------------------------------------
+  /** Bracket a pass and return the descriptor to attach, or undefined. */
+  private markPass(encoder: GPUCommandEncoder, label: string): GPUComputePassTimestampWrites | undefined {
+    return this.timer ? this.timer.bracket(encoder, label, true) : undefined;
+  }
+
   /**
-   * Timing for the compute stage, using the slot that the particle pass is not
-   * using this frame. Returns undefined when timestamps are unavailable or the
-   * chosen slot still has an outstanding map.
+   * Close the frame's brackets, resolve them, and read the breakdown back.
+   *
+   * Sampling is throttled rather than done every frame: a readback per frame
+   * would add a map/unmap pair and a queue submission to the very loop being
+   * measured, and the pass contents change only when quality or the pass list
+   * does. Once every sixth frame keeps the numbers representative while leaving
+   * the measured frame almost untouched.
    */
-  private beginComputeTiming(): GPUComputePassTimestampWrites | undefined {
-    if (!this.ctx.hasTimestamp || this.querySets.length < 2) return undefined;
-    const slot = this.computeSlot;
-    if (this.queryBusy[slot]) return undefined;
-    this.computePending = true;
-    return { querySet: this.querySets[slot]!, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 };
-  }
-
-  private beginTiming(): GPURenderPassTimestampWrites | undefined {
-    if (!this.ctx.hasTimestamp || this.pendingQuery || this.querySets.length === 0) return undefined;
-    const slot = this.queryIndex % this.querySets.length;
-    if (this.queryBusy[slot]) return undefined;
-    const set = this.querySets[slot]!;
-    // Pass-level timestamps: the pass writes index 0 on entry and index 1 on
-    // exit, which avoids depending on GPUCommandEncoder.writeTimestamp (a newer
-    // addition that is not present in every implementation).
-    this.pendingQuery = {
-      slot,
-      descriptor: { querySet: set, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 },
-    };
-    return this.pendingQuery.descriptor;
-  }
-
-  private endTiming(device: GPUDevice): void {
-    const pending = this.pendingQuery;
-    if (!pending) {
-      this.measureCompute(device);
+  private finishTiming(): void {
+    const timer = this.timer;
+    if (!timer) return;
+    timer.finish();
+    if (this.profileCountdown > 0) {
+      this.profileCountdown--;
+      // Still resolve so the brackets do not accumulate, but skip the map.
+      void timer.collect();
       return;
     }
-    this.pendingQuery = null;
-    const slot = pending.slot;
-
-    // Both stages are resolved in one submission: the render pass timing from
-    // `pending`, and the compute pass timing from `computeSlot` (they are always
-    // different slots, which is why two query sets are allocated).
-    const enc = device.createCommandEncoder({ label: 'timestamp-resolve' });
-    enc.resolveQuerySet(pending.descriptor.querySet, 0, 2, this.queryResolve[slot]!, 0);
-    enc.copyBufferToBuffer(this.queryResolve[slot]!, 0, this.queryBufs[slot]!, 0, 16);
-    const computeSlot = this.computeSlot;
-    if (this.computePending) {
-      this.computePending = false;
-      enc.resolveQuerySet(this.querySets[computeSlot]!, 0, 2, this.queryResolve[computeSlot]!, 0);
-      enc.copyBufferToBuffer(this.queryResolve[computeSlot]!, 0, this.queryBufs[computeSlot]!, 0, 16);
-    }
-    device.queue.submit([enc.finish()]);
-
-    this.queryBusy[slot] = true;
-    this.queryIndex++;
-
-    // The render-pass timer brackets only the particle pass, so it is reported
-    // as the draw cost rather than as the whole frame.
-    this.readBack(device, slot, (ms) => {
-      this.gpuMs = this.gpuMs * 0.85 + ms * 0.15;
-    });
-    if (this.queryBusy[computeSlot]) return;
-    this.readBack(device, computeSlot, (ms) => {
-      this.computeMs = this.computeMs * 0.85 + ms * 0.15;
+    this.profileCountdown = 5;
+    void timer.collect().then((timings) => {
+      if (!timings.length) return;
+      this.lastTimings = timings;
+      let total = 0;
+      let compute = 0;
+      for (const t of timings) {
+        total += t.ms;
+        if (t.label.startsWith('simulate')) compute += t.ms;
+      }
+      this.gpuMs = total;
+      this.computeMs = compute;
     });
   }
 
-  /** Resolve the compute stage alone when no render timing was recorded. */
-  private measureCompute(device: GPUDevice): void {
-    const slot = this.computeSlot;
-    if (!this.computePending || this.queryBusy[slot]) return;
-    this.computePending = false;
-    const enc = device.createCommandEncoder({ label: 'compute-timestamp-resolve' });
-    enc.resolveQuerySet(this.querySets[slot]!, 0, 2, this.queryResolve[slot]!, 0);
-    enc.copyBufferToBuffer(this.queryResolve[slot]!, 0, this.queryBufs[slot]!, 0, 16);
-    device.queue.submit([enc.finish()]);
-    this.readBack(device, slot, (ms) => {
-      this.computeMs = this.computeMs * 0.85 + ms * 0.15;
-    });
+  private profileCountdown = 0;
+  private adaptationFrozen = false;
+  /** Drawn particles the frame could not afford, for the HUD. */
+  private culledByBudget = 0;
+
+  /** Per-pass GPU breakdown from the most recent profiled frame. */
+  get passTimings(): PassTiming[] {
+    return this.lastTimings;
   }
 
-  private readBack(device: GPUDevice, slot: number, onValue: (ms: number) => void): void {
-    const readBuf = this.queryBufs[slot]!;
-    this.queryBusy[slot] = true;
-    readBuf
-      .mapAsync(GPUMapMode.READ)
-      .then(() => {
-        const data = new BigUint64Array(readBuf.getMappedRange().slice(0));
-        readBuf.unmap();
-        const start = data[0] ?? 0n;
-        const end = data[1] ?? 0n;
-        if (end > start) onValue(Number(end - start) / 1e6);
-      })
-      .catch(() => {
-        /* mapping can fail on device loss; timing is optional */
-      })
-      .finally(() => {
-        this.queryBusy[slot] = false;
-      });
-    void device;
+  /** Hold the quality level still for a profiling run. */
+  freezeAdaptation(frozen: boolean): void {
+    this.adaptationFrozen = frozen;
   }
+
+  /** Select an ablation for the particle pass. Used by the profiling tools. */
+  setAblation(mode: string): void {
+    this.ablation = mode;
+  }
+
 
   dispose(): void {
     this.particles.dispose();
     this.post.dispose();
     this.simUniform.destroy();
-    for (const b of this.queryBufs) b.destroy();
-    for (const b of this.queryResolve) b.destroy();
-    this.queryBufs.length = 0;
-    this.queryResolve.length = 0;
-    this.querySets.length = 0;
+    this.timer?.dispose();
+    this.timer = null;
   }
 
   /** Live camera framing, settable so the calibration runner can measure it. */

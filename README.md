@@ -135,6 +135,8 @@ One `requestAnimationFrame` tick does all CPU work, records one command encoder 
 | `src/ui/panel.ts` + `styles.css` | Sliders, stats readouts, buttons, toasts, idle fade; glass styling, focus rings, reduced motion |
 | `src/main.ts` | Bootstrap, backend selection, frame loop, URL-hash persistence, PNG/WebM export |
 | `tools/verify.mjs` | Headless Chrome verification runner (§12) |
+| `tools/profile-gpu.mjs` | Per-pass GPU breakdown and ablations (`pnpm profile`) |
+| `tools/tune-visual.mjs` | Visual calibration loop that measures structure, not taste (`pnpm tune`) |
 | `index.html` | The single page: canvas, boot overlay, ARIA prose, hint strip |
 
 ### The ping-pong parity trick
@@ -437,6 +439,56 @@ It writes `perf/report.json`, `perf/report.md` and `perf/gpu-frame.png`, and exi
 
 A headless Chrome compositor does not present a WebGPU canvas to `page.screenshot()`, and `canvas.getContext('2d').drawImage(webgpuCanvas, …)` returns empty pixels. Both produce a *blank* image that looks exactly like a renderer that never drew anything. The runner therefore arms an in-page capture that copies the swap-chain texture with `copyTextureToBuffer` immediately after the frame's own submission. That is why `perf/gpu-frame.png` is the file to inspect and the four `perf/0*.png` screenshots are only useful for checking layout and chrome.
 
+### Where the frame time actually goes
+
+Attribution has to be measured, so `tools/profile-gpu.mjs` brackets **every pass** in
+the frame with GPU timestamps and prints the breakdown. On the reference machine the
+result was not what the design assumed:
+
+```
+pass                       ms   share
+particles               48.93   99.3%
+simulate                 0.12    0.2%
+composite                0.06    0.1%
+fxaa                     0.05    0.1%
+fade-scene               0.04    0.1%
+bloom-* (9 passes)       ~0.05    0.1%
+dof-* / godray           ~0.15    0.3%
+```
+
+The whole hand-written post chain — thirteen bloom levels, volumetric streaks,
+depth-of-field, chromatic aberration, ACES, grain, vignette, FXAA — costs **under
+1 ms combined**. The simulation of a million 4D particles costs **0.12 ms**. The
+particle rasterisation pass was **99% of the frame**, and that is what the
+performance work targeted.
+
+Two things came out of that, both measured by ablation rather than reasoned about:
+
+- **An integer modulo per vertex.** The shader mapped instances to particles with
+  `inst % count`. Unsigned integer modulo is not a hardware instruction on current
+  GPUs; it expands into a long reciprocal-multiply sequence, and it ran once per
+  vertex — millions of times per frame. Replacing it with an exact float division
+  (`inst - count * floor(inst / count)`, exact because the count is under 2^24)
+  is the single largest change in this codebase's history.
+- **Sprite quads sized to a fixed multiple of the sprite.** The bounding quad was
+  several times larger than the visible glow, so most fragments were rasterised and
+  then discarded. Sizing the quad to the radius where the gaussian has actually
+  decayed (`sqrt(-ln(T)/12)`) removed the wasted fill.
+
+After those, a fill-rate ablation (sprite radius forced to about one pixel) still
+cost 29 ms at 1.57M drawn particles — that residue is per-*instance* vertex work,
+which does not care about sprite size at all. Both terms scale with the drawn count,
+and fill additionally scales with radius squared. That is why the particle budget is
+now **derived from the sprite radius** rather than fixed: larger sprites merge into
+gas at a lower count, smaller ones form dense star fields at a higher count, and the
+frame cost stays bounded either way. When the budget declines to draw everything the
+user asked for, the HUD says so rather than silently looking like a broken slider.
+
+The measured cost is roughly **55 ns per drawn particle** through a headless
+compositor, which is the figure the budget's constant is fitted to. Treat it as a
+floor: a foreground window with a real swap chain should sustain more, and the SHOW
+PARTICLES slider takes it higher by choice.
+
 ### Measured results
 
 Measured on the reference machine this repository was developed on — NVIDIA RTX A5000, 16 logical cores, Chrome 154, Windows, 1920 × 1080 viewport:
@@ -447,23 +499,29 @@ Measured on the reference machine this repository was developed on — NVIDIA RT
 | Time to first rendered frame | **~1.05 s** |
 | Shader compilation errors | **0** (across all 14 WGSL modules) |
 | Console / page errors | **0** |
-| Captured frame, mean luma | 13.5 / 255 |
-| Captured frame, peak luma | 221 / 255 |
-| Pixels above 6/255 | 75.8% |
+| Captured frame, mean luma | 11.2 / 255 |
+| Captured frame, peak luma | 217 / 255 |
+| Pixels above 6/255 | 63.9% |
 | Pixels fully clipped (above 242/255) | **0.0%** |
-| Tile luma spread (40 × 18 grid) | sd 7.7 over a mean of 8.3; p50 7.0, p95 14.3, max 97.2 |
-| Estimated VRAM | 292–352 MB depending on render scale |
-| CPU cost per frame | 0.31–0.44 ms |
+| GPU time, whole frame (in-app timestamps) | **19–20 ms** at the shipped defaults |
+| GPU time, particle pass | 19 ms of that |
+| GPU time, simulation | 0.7 ms |
+| GPU time, entire post chain | 0.8 ms |
+| Estimated VRAM | 218–240 MB |
 
-The two numbers worth reading closely are **zero clipped pixels with a peak of 221**: the nebula reaches near-white in its filament cores while nothing in the frame blows out, which is the whole point of grading in HDR and tone mapping last. And the **tile spread** is what distinguishes a nebula from a grey wash — a flat mean would show sd near zero.
+The two numbers worth reading closely are **zero clipped pixels with a peak of 217**:
+the nebula reaches near-white in its filament cores while nothing in the frame blows
+out, which is the whole point of grading in HDR and tone mapping last. And the
+**particle pass share** is where any future optimisation should go — everything else
+in the frame is already under a millisecond.
 
 ### About the FPS figures
 
-`perf/report.md` also reports an rAF-derived frame time, and in headless that figure reads around 23–60 ms. **Treat it as a lower bound, not a score.** Headless Chrome composites every frame to a virtual display and applies backpressure to `requestAnimationFrame` that has nothing to do with GPU cost; the in-app GPU timers report the stages directly, and the discrepancy is measurable — the in-app counter reads 56–57 FPS while the runner's rAF sampler reads 33 FPS *for the same frames*.
+`perf/report.md` also reports an rAF-derived frame time, and in headless that figure reads around 23–60 ms. **Treat it as a lower bound, not a score** — and, for the same reason, treat the GPU figures above as a floor too. Headless Chrome composites every frame to a virtual display and applies backpressure to `requestAnimationFrame` that has nothing to do with GPU cost; the in-app GPU timers report the stages directly, and the discrepancy is measurable — the in-app counter reads 56–57 FPS while the runner's rAF sampler reads 33 FPS *for the same frames*.
 
-This is also why the adaptive controller was changed to key off GPU timestamps rather than rAF deltas: with rAF as the signal, a throttled compositor made the renderer shed quality for reasons that had nothing to do with it, and it degraded to 8% of the particle budget while the GPU stage was using a quarter of the frame. See `GpuRenderer.adapt()` for the signal selection and the reasoning.
+This is also why the adaptive controller keys off GPU timestamps rather than rAF deltas: with rAF as the signal, a throttled compositor made the renderer shed quality for reasons that had nothing to do with it, and it degraded to 8% of the particle budget while the GPU stage was using a quarter of the frame. See `GpuRenderer.adapt()` for the signal selection and the reasoning.
 
-**Honest statement of scope.** This was verified on one machine, in headless Chrome. The renderer's own instrumentation reports the particle pass and the simulation stage separately, and both are comfortably inside a 16.6 ms budget at the default desktop settings; sustained 60 FPS at 1080p on desktop-class hardware is what the defaults are tuned for. It has **not** been verified on a mid-range laptop GPU, on Apple silicon, or on a physical phone, and the mobile tier's 30 FPS target is a design intent, not a measurement.
+**Honest statement of scope.** This was verified on one machine, in headless Chrome, and the per-particle cost quoted above was measured in that environment. The renderer's instrumentation now reports every pass separately, so the breakdown can be reproduced anywhere with `pnpm profile`. It has **not** been verified on a mid-range laptop GPU, on Apple silicon, or on a physical phone, and the mobile tier's 30 FPS target is a design intent, not a measurement.
 
 ## Project layout
 
@@ -502,10 +560,10 @@ Aetheria/
 │       └── styles.css         glass UI, focus rings, sr-only, reduced motion
 └── tools/
     ├── verify.mjs                 headless verification runner (§12)
-    ├── lint-shader-literals.mjs   guards against stray backticks in embedded WGSL
-    ├── list-backticks.mjs         prints backtick locations in a source file
-    ├── strip-interior-backticks.mjs  removes backticks that would end a shader literal
-    └── fix-*.mjs                  one-off repair scripts kept for provenance
+    ├── profile-gpu.mjs            per-pass GPU breakdown and ablations
+    ├── tune-visual.mjs            visual calibration loop
+    ├── compile-glsl.mjs           compiles every GLSL source and prints all logs
+    └── check-docs.mjs             cross-checks README paths, scripts and deps
 ```
 
 ## Troubleshooting

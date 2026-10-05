@@ -360,6 +360,23 @@ class Aetheria {
       };
       (window as unknown as Record<string, unknown>).__AETHERIA_SETTLE = (ms: number) =>
         new Promise((resolve) => window.setTimeout(resolve, ms));
+      // Per-pass GPU breakdown. Kept out of the UI on purpose: the panel has no
+      // room for two dozen rows, and the numbers only matter while deciding what
+      // to optimise.
+      (window as unknown as Record<string, unknown>).__AETHERIA_PASSES = () => {
+        const r = this.renderer as unknown as { passTimings?: { label: string; ms: number }[] };
+        return r.passTimings ?? [];
+      };
+      // Ablation switch for the particle pass, so a profiling run can measure one
+      // suspect at a time instead of reasoning about it.
+      (window as unknown as Record<string, unknown>).__AETHERIA_FREEZE = (frozen: boolean) => {
+        const r = this.renderer as unknown as { freezeAdaptation?: (f: boolean) => void };
+        r.freezeAdaptation?.(frozen);
+      };
+      (window as unknown as Record<string, unknown>).__AETHERIA_ABLATE = (mode: string) => {
+        const r = this.renderer as unknown as { setAblation?: (m: string) => void };
+        r.setAblation?.(mode);
+      };
     }
     this.hideBoot();
     this.lastNow = performance.now();

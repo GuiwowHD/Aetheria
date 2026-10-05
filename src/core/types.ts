@@ -33,6 +33,14 @@ export interface HudStats {
   computeMs: number;
   simCount: number;
   renderCount: number;
+  /**
+   * Particles the frame budget could not afford at the current sprite radius.
+   *
+   * Reported rather than silently dropped: the budget scales with sprite size, so
+   * raising Show Particles while the sprites are large means the renderer declines
+   * to draw all of them, and the user should be able to see that.
+   */
+  culledCount: number;
   drawVertices: number;
   renderScale: number;
   drawWidth: number;

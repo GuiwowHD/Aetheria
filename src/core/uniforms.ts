@@ -93,7 +93,15 @@ export interface SimState {
   shockGain: number;
   bloom: number;
   dpr: number;
-  quality: number;
+  /**
+   * Power-of-two particle stride for the vertex shader's instance mapping.
+   *
+   * It occupies the slot the render-scale value used to hold, on purpose: the
+   * shader needs a per-frame scalar to decode the instance index without an
+   * integer modulo, and the render scale was never read from the GPU. See the
+   * mapping comment in `particle.wgsl.ts`.
+   */
+  stride: number;
 
   focusDist: number;
   aperture: number;
@@ -108,6 +116,8 @@ export interface SimState {
   trailDecay: number;
   paletteMix: number;
   saturation: number;
+  /** Sprite-radius multiplier; 1 normally, tiny during a fill-rate ablation. */
+  spriteScale: number;
 }
 
 export function makeSimState(): SimState {
@@ -151,7 +161,7 @@ export function makeSimState(): SimState {
     shockGain: 1,
     bloom: 0.62,
     dpr: 1,
-    quality: 1,
+    stride: 1024,
     focusDist: 3.4,
     aperture: 0.45,
     grain: 0.35,
@@ -163,6 +173,7 @@ export function makeSimState(): SimState {
     trailDecay: 0.62,
     paletteMix: 0.55,
     saturation: 1,
+    spriteScale: 1,
   };
 }
 
@@ -198,10 +209,10 @@ export class SimWriter {
 
     v4(SIM_OFF.rot0, s.rot0[0], s.rot0[1], s.rot0[2], s.rot0[3]);
     v4(SIM_OFF.rot1, s.rot1[0], s.rot1[1], s.rot1[2], s.rot1[3]);
-    v4(SIM_OFF.misc, s.shockGain, s.bloom, s.dpr, s.quality);
+    v4(SIM_OFF.misc, s.shockGain, s.bloom, s.dpr, s.stride);
     v4(SIM_OFF.focus, s.focusDist, s.aperture, s.grain, s.vignette);
     v4(SIM_OFF.shockMisc, s.activeShocks, s.shockRadius, s.shockThickness, s.shockLife);
-    v4(SIM_OFF.misc2, s.trailDecay, s.paletteMix, s.saturation, 0);
+    v4(SIM_OFF.misc2, s.trailDecay, s.paletteMix, s.saturation, s.spriteScale);
 
     return this.data;
   }
@@ -249,6 +260,13 @@ export interface PostState {
   bloomLevels: number;
   hue: number;
   saturation: number;
+  /**
+   * Particle-count pre-exposure, written to pColor.z.
+   *
+   * Additive emission integrates with the number of emitters, so the composite
+   * divides by sqrt(N) here; without it a 4M-particle cloud clips to white while a
+   * 250k one is nearly black.
+   */
   quality: number;
   sceneLuma: number;
 }
